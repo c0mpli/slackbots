@@ -1,28 +1,24 @@
-import { RTMClient } from "@slack/rtm-api";
 import axios from "axios";
 import dotenv from "dotenv";
 dotenv.config();
 
 const slackToken = process.env.SLACK_USER_TOKEN;
 const githubToken = process.env.GITHUB_TOKEN;
-const allowedUsers = process.env.ALLOWED_USER_IDS.split(",");
+const allowedUsers = (process.env.ALLOWED_USER_IDS || "")
+  .split(",")
+  .map((id) => id.trim())
+  .filter(Boolean);
 
-const rtm = new RTMClient(slackToken);
+let latestTimestamps = {};
 
-// --- SLACK MESSAGE HELPER ---
-async function sendMessage(channel, text, thread_ts = null) {
-  try {
-    await axios.post(
-      "https://slack.com/api/chat.postMessage",
-      { channel, text, thread_ts },
-      { headers: { Authorization: `Bearer ${slackToken}` } }
-    );
-  } catch (err) {
-    console.error("Failed to send Slack message:", err);
-  }
+async function sendMessage(channel, text) {
+  await axios.post(
+    "https://slack.com/api/chat.postMessage",
+    { channel, text },
+    { headers: { Authorization: `Bearer ${slackToken}` } }
+  );
 }
 
-// --- GITHUB HELPERS ---
 async function approvePR(owner, repo, prNumber) {
   await axios.post(
     `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/reviews`,
@@ -36,46 +32,57 @@ async function approvePR(owner, repo, prNumber) {
   );
 }
 
-// --- SLACK EVENT HANDLER ---
-rtm.on("message", async (event) => {
-  try {
-    if (!event.text || !event.user || !event.channel) return;
+async function getDMs() {
+  const res = await axios.get("https://slack.com/api/conversations.list", {
+    headers: { Authorization: `Bearer ${slackToken}` },
+    params: { types: "im", limit: 100 },
+  });
+  return res.data.channels || [];
+}
 
-    const { text, user, channel, ts } = event;
+async function getMessages(channel) {
+  const res = await axios.get("https://slack.com/api/conversations.history", {
+    headers: { Authorization: `Bearer ${slackToken}` },
+    params: { channel, limit: 1 },
+  });
+  return res.data.messages || [];
+}
 
-    // --- Access Control ---
-    if (!allowedUsers.includes(user)) {
-      if (text.startsWith("!approve")) {
-        console.log("User not allowed to run this command: ", user);
-      }
-      return;
-    }
+async function pollSlack() {
+  const dms = await getDMs();
 
-    const urlMatch = text.match(
+  for (const dm of dms) {
+    const messages = await getMessages(dm.id);
+    if (!messages.length) continue;
+
+    const latest = messages[0];
+    const user = dm.user;
+    const ts = latest.ts;
+
+    if (latestTimestamps[dm.id] === ts) continue;
+    latestTimestamps[dm.id] = ts;
+
+    const text = latest.text?.trim();
+    if (!text || !allowedUsers.includes(user)) continue;
+
+    const match = text.match(
       /https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/
     );
-    if (!urlMatch) return;
+    if (!match) continue;
 
-    const [, owner, repo, prNumber] = urlMatch;
+    const [, owner, repo, prNumber] = match;
 
     if (text.startsWith("!approve")) {
       await sendMessage(
-        channel,
-        `Approving PR #${prNumber} in *${owner}/${repo}*...`,
-        ts
+        dm.id,
+        `Approving PR #${prNumber} in ${owner}/${repo}...`
       );
-
       await approvePR(owner, repo, prNumber);
-
-      await sendMessage(channel, `PR #${prNumber} approved successfully!`, ts);
-      return;
+      await sendMessage(dm.id, `PR #${prNumber} approved successfully!`);
     }
-  } catch (err) {
-    console.error("Error: ", err);
   }
-});
+}
 
-(async () => {
-  await rtm.start();
-  console.log("Slack GitHub Approver bot is running...");
-})();
+// Poll every 10 seconds
+setInterval(pollSlack, 10000);
+console.log("Listening to your DMs every 10s...");
